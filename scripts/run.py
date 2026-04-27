@@ -8,6 +8,10 @@ def get_run_command(dataset, task, mode, prompt_type, model):
     # ===================== set folders ======================
 
     # basic patches
+    # FEAT_DIR can hold either:
+    #   - PRET's per-patch features:  <FEAT_DIR>/<slide>_files/x20/<x>_<y>.npy
+    #   - trident-extracted features: <FEAT_DIR>/<slide>.h5
+    # core/main.py:feature_processor auto-detects which one is present per slide.
     WSI_DIR = 'data/' + dataset + '/images'
     FEAT_DIR = 'data/' + dataset + '/patch/features'
     COLLECTED_FEAT_DIR = 'data/' + dataset + '/patch/collected_features'

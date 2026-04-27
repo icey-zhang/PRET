@@ -34,6 +34,93 @@ from modules import inference, load_weak_prompts, execute_tagger, \
 
 # ====================== collect features and information ======================
 
+def _load_legacy_npy_slide(in_dir, v, args):
+    """Read PRET's per-patch .npy features for a single slide (legacy pipeline)."""
+    feats, names, patch_label = [], [], []
+
+    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+
+    in_dir = in_dir if in_dir[-1] != '/' else in_dir[:-1]
+    patch_path = in_dir.replace(in_dir.split('/')[-2], 'images')
+    ori_dir = sorted([int(_) for _ in os.listdir(patch_path)])[-1]
+    patch_path = os.path.join(patch_path, str(ori_dir))
+
+    for f in os.listdir(os.path.join(in_dir, 'x20')):
+        name = os.path.join(patch_path, f.replace('.npy', '.jpeg'))
+        if os.path.getsize(name) < args.file_min_size:
+            continue
+
+        feat = np.load(os.path.join(in_dir, 'x20', f))
+        feat = feat / np.linalg.norm(feat, ord=2, axis=0)
+
+        x, y = f.split('.')[0].split('_')
+        x, y = int(x), int(y)
+        if mask is not None:
+            patch_label.append(mask[y, x])
+
+        names.append(name)
+        feats.append(feat)
+
+    return feats, names, patch_label
+
+
+def _load_trident_h5_slide(h5_path, slide_name, v, args):
+    """Read a trident-extracted .h5 feature file for a single slide.
+
+    Expected layout (matches the trident patch feature extractor):
+        features  : (N, D) float patch features
+        coords    : (N, 2) int patch top-left coordinates in level-0 pixels
+        attrs     : 'patch_size_level0' / 'patch_size' on the file or 'coords' dataset
+
+    Returns (feats, names, patch_label) in the same shape as the legacy loader so
+    downstream taggers, inference and visualisation keep working unchanged. Patch
+    names are synthesised as "<raw_feature_path>/<slide_name>/<x>_<y>.jpeg" so the
+    existing coord parsing (basename split by '_') and the "slide_name in patch_name"
+    lookups in modules.py still match.
+    """
+    import h5py
+
+    feats, names, patch_label = [], [], []
+    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+
+    with h5py.File(h5_path, 'r') as h5:
+        features = h5['features'][:]
+        coords = h5['coords'][:]
+
+        # discover the patch size in level-0 pixels (used to map coords -> grid index)
+        attrs = {}
+        attrs.update(dict(h5.attrs))
+        if 'coords' in h5:
+            attrs.update(dict(h5['coords'].attrs))
+        patch_size_l0 = int(attrs.get('patch_size_level0',
+                                      attrs.get('patch_size',
+                                                args.patch_scale)))
+        if patch_size_l0 <= 0:
+            patch_size_l0 = args.patch_scale
+
+    patch_path = os.path.join(args.raw_feature_path, slide_name)
+
+    for i in range(features.shape[0]):
+        feat = features[i].astype(np.float32)
+        norm = np.linalg.norm(feat, ord=2)
+        if norm > 0:
+            feat = feat / norm
+
+        x_idx = int(coords[i][0]) // patch_size_l0
+        y_idx = int(coords[i][1]) // patch_size_l0
+
+        if mask is not None:
+            try:
+                patch_label.append(mask[y_idx, x_idx])
+            except IndexError:
+                patch_label.append(0)
+
+        names.append(os.path.join(patch_path, '%d_%d.jpeg' % (x_idx, y_idx)))
+        feats.append(feat)
+
+    return feats, names, patch_label
+
+
 def feature_processor(args):
     print('start feature processing ...')
     dataset_info = json.load(open(args.dataset_info))
@@ -43,38 +130,20 @@ def feature_processor(args):
         if os.path.exists(os.path.join(args.dump_features, k + '.npy')):
             continue
 
-        feats, names, patch_label, wsi_label = [], [], [], -1
-        
         wsi_label = v['wsi_label']
 
-        # patch label as segmentation gt, if any
-        if 'patch_labels' in v:
-            mask = cv2.imread(v['patch_labels'])[:, :, 0]
+        # auto-detect feature source: trident-extracted .h5 (one file per slide)
+        # takes priority; otherwise fall back to PRET's legacy per-patch .npy dir.
+        h5_path = os.path.join(args.raw_feature_path, k + '.h5')
+        legacy_dir = os.path.join(args.raw_feature_path, k + '_files')
 
-        in_dir = os.path.join(args.raw_feature_path, k + '_files')
-        in_dir = in_dir if in_dir[-1] != '/' else in_dir[:-1]
-        patch_path = in_dir.replace(in_dir.split('/')[-2], 'images')
-        ori_dir = sorted([int(_) for _ in os.listdir(patch_path)])[-1]
-        patch_path = os.path.join(patch_path, str(ori_dir))
+        if os.path.exists(h5_path):
+            feats, names, patch_label = _load_trident_h5_slide(h5_path, k, v, args)
+        elif os.path.isdir(legacy_dir):
+            feats, names, patch_label = _load_legacy_npy_slide(legacy_dir, v, args)
+        else:
+            continue
 
-        for f in os.listdir(os.path.join(in_dir, 'x20')):
-            name = os.path.join(patch_path, f.replace('.npy', '.jpeg'))
-            if os.path.getsize(name) < args.file_min_size:
-                continue
-            
-            # load feature, L2 norm
-            feat = np.load(os.path.join(in_dir, 'x20', f))
-            feat = feat / np.linalg.norm(feat, ord=2, axis=0)
-
-            # get position for vis and seg
-            x, y = f.split('.')[0].split('_')
-            x, y = int(x), int(y)
-            if 'patch_labels' in v:
-                patch_label.append(mask[y, x])
-
-            names.append(name)
-            feats.append(feat)
-        
         if len(names) == 0:
             continue
 
@@ -82,7 +151,7 @@ def feature_processor(args):
         info = {'features': np.stack(feats, 0), 'patch_names': names, \
             'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
-    
+
     print('finish feature processing and saving!')
 
 
