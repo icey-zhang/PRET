@@ -34,11 +34,31 @@ from modules import inference, load_weak_prompts, execute_tagger, \
 
 # ====================== collect features and information ======================
 
+def _load_patch_label_mask(v):
+    """Load segmentation GT for a slide if present and readable on disk.
+
+    Returns the (H, W) uint8 mask, or None when there is no patch_labels entry
+    or the file is missing/unreadable. Classification / screening tasks don't
+    need this, so a missing GT must not crash feature_processor.
+    """
+    if 'patch_labels' not in v:
+        return None
+    path = v['patch_labels']
+    if not os.path.exists(path):
+        print('warning: patch_labels file missing, skipping mask: ' + path)
+        return None
+    img = cv2.imread(path)
+    if img is None:
+        print('warning: patch_labels file unreadable, skipping mask: ' + path)
+        return None
+    return img[:, :, 0]
+
+
 def _load_legacy_npy_slide(in_dir, v, args):
     """Read PRET's per-patch .npy features for a single slide (legacy pipeline)."""
     feats, names, patch_label = [], [], []
 
-    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+    mask = _load_patch_label_mask(v)
 
     in_dir = in_dir if in_dir[-1] != '/' else in_dir[:-1]
     patch_path = in_dir.replace(in_dir.split('/')[-2], 'images')
@@ -81,7 +101,7 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
     import h5py
 
     feats, names, patch_label = [], [], []
-    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+    mask = _load_patch_label_mask(v)
 
     with h5py.File(h5_path, 'r') as h5:
         features = h5['features'][:]
