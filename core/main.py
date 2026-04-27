@@ -141,6 +141,43 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
     return feats, names, patch_label
 
 
+def _dataset_match(args, hint):
+    """True if the dataset corresponds to `hint` (e.g. 'TCGA' / 'CAMELYON' / 'LN').
+
+    Looks at --wsi_path, --dataset_info path, and the first slide name in the
+    dataset_info JSON. This preserves dataset-specific behaviour (TCGA
+    same-patient filtering, CAMELYON binary sampling, ...) even when
+    --wsi_path is left empty because features were extracted by trident.
+    """
+    if hint in (args.wsi_path or ''):
+        return True
+    if hint in (args.dataset_info or ''):
+        return True
+    try:
+        with open(args.dataset_info) as fh:
+            d = json.load(fh)
+        for k in d:
+            return hint in k
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_wsi_suffix(wsi_path):
+    """Return the WSI file extension found in wsi_path, or '' if unavailable.
+
+    Pure-classification runs on trident-extracted h5 features don't need the raw
+    WSIs at all. When wsi_path is missing/empty we fall back to '', and the
+    downstream os.path.exists guards on the joined path keep openslide from
+    being called (size becomes None -> heatmap branch is skipped).
+    """
+    try:
+        files = [f for f in os.listdir(wsi_path) if not f.startswith('.')]
+    except (FileNotFoundError, NotADirectoryError, TypeError):
+        return ''
+    return files[0].split('.')[-1] if files else ''
+
+
 def feature_processor(args):
     print('start feature processing ...')
     dataset_info = json.load(open(args.dataset_info))
@@ -264,7 +301,7 @@ def evaluate(args, val_only=False):
                     pn = dataset_info[n]['pos_patch_num']
                     
                     # prompt samplinging (camelyon only)
-                    if args.c == 1 and 'CAMELYON' in args.wsi_path:
+                    if args.c == 1 and _dataset_match(args, 'CAMELYON'):
                         if pn >= 1000 and pn < 3000:
                             labeled_names.append(n)
                     
@@ -316,7 +353,7 @@ def evaluate(args, val_only=False):
                     rest_names.append(ln)
 
         # avoid same patients in different split, in-house data is cleaned
-        if 'TCGA' in args.wsi_path:
+        if _dataset_match(args, 'TCGA'):
             rest_names = check_different_patient(example_names, rest_names, 'TCGA')
 
         random.shuffle(rest_names)
@@ -447,7 +484,7 @@ def evaluate(args, val_only=False):
 
             # predict for test slides, name a test slide as query to avoid confusion with test set
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
-            wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
+            wsi_suffix = _resolve_wsi_suffix(args.wsi_path)
             all_query_names = val_names if val_only else val_names + test_names
             for n in all_query_names:
                 query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
@@ -618,7 +655,7 @@ def evaluate_baseline(args, mode):
                     pn = dataset_info[n]['pos_patch_num']
 
                     # prompt samplinging (camelyon only)
-                    if args.c == 1 and 'CAMELYON' in args.wsi_path:
+                    if args.c == 1 and _dataset_match(args, 'CAMELYON'):
                         if pn >= 1000 and pn < 3000:
                             labeled_names.append(n)
 
@@ -669,9 +706,9 @@ def evaluate_baseline(args, mode):
                 if ln not in example_names and ln not in neg_names:
                     rest_names.append(ln)
 
-        if 'TCGA' in args.wsi_path:
+        if _dataset_match(args, 'TCGA'):
             rest_names = check_different_patient(example_names, rest_names, 'TCGA')
-        if 'LN' in args.wsi_path:
+        if _dataset_match(args, 'LN'):
             rest_names = check_different_patient(example_names, rest_names, 'LN')
 
         random.shuffle(rest_names)
@@ -814,7 +851,7 @@ def evaluate_baseline(args, mode):
                     wsi_pred = prob.topk(topk)[0].mean()
 
                     if args.vis_path != '' or args.seg:
-                        wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
+                        wsi_suffix = _resolve_wsi_suffix(args.wsi_path)
                         wsi_path = os.path.join(args.wsi_path, n + '.' + wsi_suffix)
                         wsi = openslide.OpenSlide(wsi_path)
                         size = (wsi.level_dimensions[0][1] // args.patch_scale, wsi.level_dimensions[0][0] // args.patch_scale)
@@ -964,7 +1001,10 @@ if __name__ == '__main__':
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
-    parser.add_argument('--wsi_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--wsi_path', default='', type=str,
+        help='Optional dir of raw WSI files. Required only for roughMask prompts, '
+             '--seg, --vis_path, or --dump_pseudo. Pure classification on '
+             'trident-extracted h5 features can leave this empty.')
     parser.add_argument('--dump_features', default=None, help='Path where to save features')
     parser.add_argument('--dump_pseudo', default='', help='Path where to save pseudo, vis and data split')
     parser.add_argument('--dump_records', default='', help='Path to save records (json file)')
