@@ -34,11 +34,31 @@ from modules import inference, load_weak_prompts, execute_tagger, \
 
 # ====================== collect features and information ======================
 
+def _load_patch_label_mask(v):
+    """Load segmentation GT for a slide if present and readable on disk.
+
+    Returns the (H, W) uint8 mask, or None when there is no patch_labels entry
+    or the file is missing/unreadable. Classification / screening tasks don't
+    need this, so a missing GT must not crash feature_processor.
+    """
+    if 'patch_labels' not in v:
+        return None
+    path = v['patch_labels']
+    if not os.path.exists(path):
+        print('warning: patch_labels file missing, skipping mask: ' + path)
+        return None
+    img = cv2.imread(path)
+    if img is None:
+        print('warning: patch_labels file unreadable, skipping mask: ' + path)
+        return None
+    return img[:, :, 0]
+
+
 def _load_legacy_npy_slide(in_dir, v, args):
     """Read PRET's per-patch .npy features for a single slide (legacy pipeline)."""
     feats, names, patch_label = [], [], []
 
-    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+    mask = _load_patch_label_mask(v)
 
     in_dir = in_dir if in_dir[-1] != '/' else in_dir[:-1]
     patch_path = in_dir.replace(in_dir.split('/')[-2], 'images')
@@ -81,7 +101,7 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
     import h5py
 
     feats, names, patch_label = [], [], []
-    mask = cv2.imread(v['patch_labels'])[:, :, 0] if 'patch_labels' in v else None
+    mask = _load_patch_label_mask(v)
 
     with h5py.File(h5_path, 'r') as h5:
         features = h5['features'][:]
@@ -121,13 +141,54 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
     return feats, names, patch_label
 
 
+def _dataset_match(args, hint):
+    """True if the dataset corresponds to `hint` (e.g. 'TCGA' / 'CAMELYON' / 'LN').
+
+    Looks at --wsi_path, --dataset_info path, and the first slide name in the
+    dataset_info JSON. This preserves dataset-specific behaviour (TCGA
+    same-patient filtering, CAMELYON binary sampling, ...) even when
+    --wsi_path is left empty because features were extracted by trident.
+    """
+    if hint in (args.wsi_path or ''):
+        return True
+    if hint in (args.dataset_info or ''):
+        return True
+    try:
+        with open(args.dataset_info) as fh:
+            d = json.load(fh)
+        for k in d:
+            return hint in k
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_wsi_suffix(wsi_path):
+    """Return the WSI file extension found in wsi_path, or '' if unavailable.
+
+    Pure-classification runs on trident-extracted h5 features don't need the raw
+    WSIs at all. When wsi_path is missing/empty we fall back to '', and the
+    downstream os.path.exists guards on the joined path keep openslide from
+    being called (size becomes None -> heatmap branch is skipped).
+    """
+    try:
+        files = [f for f in os.listdir(wsi_path) if not f.startswith('.')]
+    except (FileNotFoundError, NotADirectoryError, TypeError):
+        return ''
+    return files[0].split('.')[-1] if files else ''
+
+
 def feature_processor(args):
     print('start feature processing ...')
     dataset_info = json.load(open(args.dataset_info))
     os.makedirs(args.dump_features, exist_ok=True)
 
+    n_done, n_skip_existing, n_skip_missing, n_skip_empty = 0, 0, 0, 0
+    missing_examples = []
+
     for k, v in dataset_info.items():
         if os.path.exists(os.path.join(args.dump_features, k + '.npy')):
+            n_skip_existing += 1
             continue
 
         wsi_label = v['wsi_label']
@@ -142,20 +203,68 @@ def feature_processor(args):
         elif os.path.isdir(legacy_dir):
             feats, names, patch_label = _load_legacy_npy_slide(legacy_dir, v, args)
         else:
+            n_skip_missing += 1
+            if len(missing_examples) < 5:
+                missing_examples.append(k)
             continue
 
         if len(names) == 0:
+            n_skip_empty += 1
             continue
 
         # save patch features, name, patch_labels and wsi_labels for eval
         info = {'features': np.stack(feats, 0), 'patch_names': names, \
             'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
+        n_done += 1
 
-    print('finish feature processing and saving!')
+    if n_skip_missing:
+        print('warning: %d slides have no extracted features (missing .h5/_files dir under %s); '
+              'first few: %s' % (n_skip_missing, args.raw_feature_path, missing_examples))
+    if n_skip_empty:
+        print('warning: %d slides skipped with 0 valid patches' % n_skip_empty)
+    print('finish feature processing: %d new, %d already cached, %d missing, %d empty (total %d)'
+          % (n_done, n_skip_existing, n_skip_missing, n_skip_empty, len(dataset_info)))
 
 
 # ====================== some util functions ======================
+
+# Cache loaded per-slide feature dicts across evaluate() / evaluate_baseline()
+# invocations. Each np.load + pickle decode of a .npy dict is the dominant
+# cost in evaluation (called runs * classes * shots * num_slides times),
+# so a simple in-process cache turns the disk-bound loop into a dict lookup.
+# Callers MUST copy any array they mutate in place (only 'patch_labels' is
+# mutated by current code paths).
+_SLIDE_CACHE = {}
+
+
+def _load_slide_features(args, name):
+    if name in _SLIDE_CACHE:
+        return _SLIDE_CACHE[name]
+    data = np.load(os.path.join(args.dump_features, name + '.npy'),
+                   allow_pickle=True).item()
+    _SLIDE_CACHE[name] = data
+    return data
+
+
+def _threshold_sweep(val_preds, val_labels, thresholds):
+    """Vectorised replacement for the per-threshold list comprehension.
+
+    val_preds:   1-D float (N,)
+    val_labels:  1-D int/float 0/1 (N,)
+    thresholds:  1-D float (T,)
+    Returns accs as 1-D float (T,) with the same semantics as the original
+    [((val_preds > t).float() == val_labels).sum() / N for t in thresholds].
+    """
+    if hasattr(val_preds, 'numpy'):
+        val_preds = val_preds.numpy()
+    if hasattr(val_labels, 'numpy'):
+        val_labels = val_labels.numpy()
+    val_labels_bool = val_labels.astype(bool)
+    # broadcast: (T, N) bool grid
+    pred_grid = val_preds[None, :] > thresholds[:, None]
+    return (pred_grid == val_labels_bool[None, :]).mean(axis=1)
+
 
 def macro_value(l, n):
     out = []
@@ -222,6 +331,18 @@ def evaluate(args, val_only=False):
     dataset_info = json.load(open(args.dataset_info))
     all_names = dataset_info.keys()
 
+    # drop slides whose features failed to extract (matches evaluate_baseline)
+    available, missing = [], []
+    for _ in all_names:
+        if os.path.exists(os.path.join(args.dump_features, _ + '.npy')):
+            available.append(_)
+        else:
+            missing.append(_)
+    if missing:
+        print('warning: %d/%d slides have no collected features and will be skipped (e.g. %s)'
+              % (len(missing), len(missing) + len(available), missing[0]))
+    all_names = available
+
     records = {}
     txt_rec = []
     # ====================== repeat experimets n=args.runs ======================
@@ -244,7 +365,7 @@ def evaluate(args, val_only=False):
                     pn = dataset_info[n]['pos_patch_num']
                     
                     # prompt samplinging (camelyon only)
-                    if args.c == 1 and 'CAMELYON' in args.wsi_path:
+                    if args.c == 1 and _dataset_match(args, 'CAMELYON'):
                         if pn >= 1000 and pn < 3000:
                             labeled_names.append(n)
                     
@@ -285,18 +406,20 @@ def evaluate(args, val_only=False):
                 break
 
         # split val set out of example and test set
+        example_set = set(example_names)
+        neg_set = set(neg_names)
         for n in all_names:
-            if n not in example_names and dataset_info[n]['fixed_test_set'] == False:
+            if n not in example_set and dataset_info[n]['fixed_test_set'] == False:
                 rest_names.append(n)
 
         if args.seg:
             rest_names = []
             for ln in labeled_names:
-                if ln not in example_names and ln not in neg_names:
+                if ln not in example_set and ln not in neg_set:
                     rest_names.append(ln)
 
         # avoid same patients in different split, in-house data is cleaned
-        if 'TCGA' in args.wsi_path:
+        if _dataset_match(args, 'TCGA'):
             rest_names = check_different_patient(example_names, rest_names, 'TCGA')
 
         random.shuffle(rest_names)
@@ -328,13 +451,13 @@ def evaluate(args, val_only=False):
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
             for n in example_names:
-                example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_n = _load_slide_features(args, n)
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    pl = example_n['patch_labels'].copy()  # mutated below; cache stays clean
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
@@ -427,10 +550,14 @@ def evaluate(args, val_only=False):
 
             # predict for test slides, name a test slide as query to avoid confusion with test set
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
-            wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
+            wsi_suffix = _resolve_wsi_suffix(args.wsi_path)
             all_query_names = val_names if val_only else val_names + test_names
+            # O(1) membership lookups in the per-slide loop below
+            val_set = set(val_names)
+            test_set = set(test_names)
+            sm = GaussianBlur(7, 3) if args.seg else None  # build once per class
             for n in all_query_names:
-                query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                query_n = _load_slide_features(args, n)
                 query_feats = torch.tensor(query_n['features']).cuda()
                 query_patch_names = query_n['patch_names']
                 label = query_n['wsi_label']
@@ -454,15 +581,14 @@ def evaluate(args, val_only=False):
                 else:
                     size = None
                 vis_info = None
-                
-                sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
+
                 wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
                     query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm)
 
-                if patch_pred != None and args.vis_path != '' and n in test_names:
+                if patch_pred != None and args.vis_path != '' and n in test_set:
                     os.makedirs(args.vis_path, exist_ok=True)
                     np.save(os.path.join(args.vis_path, n + '_' + str(cls) + '.npy'), patch_pred.cpu().numpy())
-                
+
                 if args.seg:
                     pred = torch.tensor(patch_pred_list)
                     label = torch.tensor(query_n['patch_labels'])
@@ -470,7 +596,7 @@ def evaluate(args, val_only=False):
                     pred = torch.tensor([wsi_pred])
                     label = torch.tensor([label])
 
-                if n in val_names:
+                if n in val_set:
                     val_preds.append(pred)
                     val_labels.append(label)
                 else:
@@ -489,7 +615,7 @@ def evaluate(args, val_only=False):
                 test_labels = torch.cat(test_labels)
             
             precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
+            accs = _threshold_sweep(val_preds, val_labels, thresholds)
             if args.seg:
                 f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
                 best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
@@ -598,7 +724,7 @@ def evaluate_baseline(args, mode):
                     pn = dataset_info[n]['pos_patch_num']
 
                     # prompt samplinging (camelyon only)
-                    if args.c == 1 and 'CAMELYON' in args.wsi_path:
+                    if args.c == 1 and _dataset_match(args, 'CAMELYON'):
                         if pn >= 1000 and pn < 3000:
                             labeled_names.append(n)
 
@@ -639,19 +765,21 @@ def evaluate_baseline(args, mode):
                 break
 
         # split val set out of example and test set
+        example_set = set(example_names)
+        neg_set = set(neg_names)
         for n in all_names:
-            if n not in example_names and dataset_info[n]['fixed_test_set'] == False:
+            if n not in example_set and dataset_info[n]['fixed_test_set'] == False:
                 rest_names.append(n)
 
         if args.seg:
             rest_names = []
             for ln in labeled_names:
-                if ln not in example_names and ln not in neg_names:
+                if ln not in example_set and ln not in neg_set:
                     rest_names.append(ln)
 
-        if 'TCGA' in args.wsi_path:
+        if _dataset_match(args, 'TCGA'):
             rest_names = check_different_patient(example_names, rest_names, 'TCGA')
-        if 'LN' in args.wsi_path:
+        if _dataset_match(args, 'LN'):
             rest_names = check_different_patient(example_names, rest_names, 'LN')
 
         random.shuffle(rest_names)
@@ -685,11 +813,11 @@ def evaluate_baseline(args, mode):
             # ====================== process example ======================
 
             for n in example_names:
-                example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_n = _load_slide_features(args, n)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    pl = example_n['patch_labels'].copy()  # mutated below; cache stays clean
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
@@ -775,8 +903,10 @@ def evaluate_baseline(args, mode):
             # predict query
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
             all_query_names = val_names + test_names
+            val_set = set(val_names)
+            test_set = set(test_names)
             for n in all_query_names:
-                query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                query_n = _load_slide_features(args, n)
                 query_feats = torch.tensor(query_n['features']).cuda()
                 query_patch_names = query_n['patch_names']
                 if args.c > 1:
@@ -794,7 +924,7 @@ def evaluate_baseline(args, mode):
                     wsi_pred = prob.topk(topk)[0].mean()
 
                     if args.vis_path != '' or args.seg:
-                        wsi_suffix = os.listdir(args.wsi_path)[0].split('.')[-1]
+                        wsi_suffix = _resolve_wsi_suffix(args.wsi_path)
                         wsi_path = os.path.join(args.wsi_path, n + '.' + wsi_suffix)
                         wsi = openslide.OpenSlide(wsi_path)
                         size = (wsi.level_dimensions[0][1] // args.patch_scale, wsi.level_dimensions[0][0] // args.patch_scale)
@@ -812,7 +942,7 @@ def evaluate_baseline(args, mode):
                                     idx_in_map.append(0)
                                 continue
 
-                        if args.vis_path != '' and n in test_names:
+                        if args.vis_path != '' and n in test_set:
                             os.makedirs(args.vis_path, exist_ok=True)
                             np.save(os.path.join(args.vis_path, n + '_' + str(cls) + '.npy'), patch_pred.cpu().numpy())
 
@@ -848,7 +978,7 @@ def evaluate_baseline(args, mode):
                     pred = torch.tensor([wsi_pred])
                     label = torch.tensor([label])
 
-                if n in val_names:
+                if n in val_set:
                     val_preds.append(pred)
                     val_labels.append(label)
                 else:
@@ -865,7 +995,7 @@ def evaluate_baseline(args, mode):
             test_labels = torch.cat(test_labels)
             
             precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
+            accs = _threshold_sweep(val_preds, val_labels, thresholds)
             if args.seg:
                 f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
                 best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
@@ -944,7 +1074,10 @@ if __name__ == '__main__':
 
     # dataset information and settings
     parser.add_argument('--raw_feature_path', default='/path/to/imagenet/', type=str)
-    parser.add_argument('--wsi_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--wsi_path', default='', type=str,
+        help='Optional dir of raw WSI files. Required only for roughMask prompts, '
+             '--seg, --vis_path, or --dump_pseudo. Pure classification on '
+             'trident-extracted h5 features can leave this empty.')
     parser.add_argument('--dump_features', default=None, help='Path where to save features')
     parser.add_argument('--dump_pseudo', default='', help='Path where to save pseudo, vis and data split')
     parser.add_argument('--dump_records', default='', help='Path to save records (json file)')
