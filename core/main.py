@@ -17,6 +17,7 @@ import sys
 import argparse
 import random
 import json
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -55,8 +56,13 @@ def _load_patch_label_mask(v):
 
 
 def _load_legacy_npy_slide(in_dir, v, args):
-    """Read PRET's per-patch .npy features for a single slide (legacy pipeline)."""
-    feats, names, patch_label = [], [], []
+    """Read PRET's per-patch .npy features for a single slide (legacy pipeline).
+
+    Returns (feats list, names list, patch_label list, coords (N,2) int32).
+    Coords are patch-grid indices and are reused later to skip per-patch string
+    parsing in inference / taggers.
+    """
+    feats, names, patch_label, coords = [], [], [], []
 
     mask = _load_patch_label_mask(v)
 
@@ -80,8 +86,10 @@ def _load_legacy_npy_slide(in_dir, v, args):
 
         names.append(name)
         feats.append(feat)
+        coords.append((x, y))
 
-    return feats, names, patch_label
+    coords = np.asarray(coords, dtype=np.int32) if coords else np.zeros((0, 2), dtype=np.int32)
+    return feats, names, patch_label, coords
 
 
 def _load_trident_h5_slide(h5_path, slide_name, v, args):
@@ -100,12 +108,11 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
     """
     import h5py
 
-    feats, names, patch_label = [], [], []
     mask = _load_patch_label_mask(v)
 
     with h5py.File(h5_path, 'r') as h5:
         features = h5['features'][:]
-        coords = h5['coords'][:]
+        coords_pix = h5['coords'][:]
 
         # discover the patch size in level-0 pixels (used to map coords -> grid index)
         attrs = {}
@@ -118,27 +125,32 @@ def _load_trident_h5_slide(h5_path, slide_name, v, args):
         if patch_size_l0 <= 0:
             patch_size_l0 = args.patch_scale
 
+    # Vectorised: pixel coords -> patch-grid indices, L2-normalise rows.
+    coords = (np.asarray(coords_pix[:, :2], dtype=np.int64) // patch_size_l0).astype(np.int32)
+    feats_arr = features.astype(np.float32, copy=False)
+    norms = np.linalg.norm(feats_arr, ord=2, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    feats_arr = feats_arr / norms
+
+    # patch_label sampled from mask grid (vectorised gather with bounds check)
+    patch_label = []
+    if mask is not None:
+        ys = np.clip(coords[:, 1], 0, mask.shape[0] - 1)
+        xs = np.clip(coords[:, 0], 0, mask.shape[1] - 1)
+        oob = (coords[:, 1] < 0) | (coords[:, 1] >= mask.shape[0]) | \
+              (coords[:, 0] < 0) | (coords[:, 0] >= mask.shape[1])
+        sampled = mask[ys, xs]
+        sampled[oob] = 0
+        patch_label = list(sampled)
+
+    # synthesise patch names that still encode <x>_<y> for any caller that
+    # falls back to filename parsing
     patch_path = os.path.join(args.raw_feature_path, slide_name)
+    names = ['%s/%d_%d.jpeg' % (patch_path, int(coords[i, 0]), int(coords[i, 1]))
+             for i in range(coords.shape[0])]
+    feats = list(feats_arr)
 
-    for i in range(features.shape[0]):
-        feat = features[i].astype(np.float32)
-        norm = np.linalg.norm(feat, ord=2)
-        if norm > 0:
-            feat = feat / norm
-
-        x_idx = int(coords[i][0]) // patch_size_l0
-        y_idx = int(coords[i][1]) // patch_size_l0
-
-        if mask is not None:
-            try:
-                patch_label.append(mask[y_idx, x_idx])
-            except IndexError:
-                patch_label.append(0)
-
-        names.append(os.path.join(patch_path, '%d_%d.jpeg' % (x_idx, y_idx)))
-        feats.append(feat)
-
-    return feats, names, patch_label
+    return feats, names, patch_label, coords
 
 
 def _dataset_match(args, hint):
@@ -199,9 +211,9 @@ def feature_processor(args):
         legacy_dir = os.path.join(args.raw_feature_path, k + '_files')
 
         if os.path.exists(h5_path):
-            feats, names, patch_label = _load_trident_h5_slide(h5_path, k, v, args)
+            feats, names, patch_label, coords = _load_trident_h5_slide(h5_path, k, v, args)
         elif os.path.isdir(legacy_dir):
-            feats, names, patch_label = _load_legacy_npy_slide(legacy_dir, v, args)
+            feats, names, patch_label, coords = _load_legacy_npy_slide(legacy_dir, v, args)
         else:
             n_skip_missing += 1
             if len(missing_examples) < 5:
@@ -212,9 +224,12 @@ def feature_processor(args):
             n_skip_empty += 1
             continue
 
-        # save patch features, name, patch_labels and wsi_labels for eval
-        info = {'features': np.stack(feats, 0), 'patch_names': names, \
-            'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
+        # save patch features, name, patch_labels, coords and wsi_labels for eval.
+        # 'coords' (N,2) int32 lets downstream code skip per-patch string parsing.
+        info = {'features': np.stack(feats, 0), 'patch_names': names,
+                'patch_labels': np.array(patch_label),
+                'coords': np.asarray(coords, dtype=np.int32),
+                'wsi_label': wsi_label}
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
         n_done += 1
 
@@ -233,18 +248,59 @@ def feature_processor(args):
 # invocations. Each np.load + pickle decode of a .npy dict is the dominant
 # cost in evaluation (called runs * classes * shots * num_slides times),
 # so a simple in-process cache turns the disk-bound loop into a dict lookup.
-# Callers MUST copy any array they mutate in place (only 'patch_labels' is
-# mutated by current code paths).
-_SLIDE_CACHE = {}
+#
+# Bounded by total patch count (FIFO eviction) to stay flat for 30K-patch
+# slides. Default cap is 5_000_000 patches (~20 GB at 1024-d fp32); override
+# with --feature_cache_patches. Callers MUST copy any array they mutate in
+# place (only 'patch_labels' is mutated by current code paths).
+_SLIDE_CACHE = OrderedDict()
+_SLIDE_CACHE_PATCHES = 0
+_SLIDE_CACHE_LIMIT = 5_000_000
+
+
+def _set_slide_cache_limit(n_patches):
+    global _SLIDE_CACHE_LIMIT
+    _SLIDE_CACHE_LIMIT = int(n_patches) if n_patches and n_patches > 0 else 0  # 0 = unbounded
 
 
 def _load_slide_features(args, name):
-    if name in _SLIDE_CACHE:
-        return _SLIDE_CACHE[name]
+    global _SLIDE_CACHE_PATCHES
+    cached = _SLIDE_CACHE.get(name)
+    if cached is not None:
+        _SLIDE_CACHE.move_to_end(name)
+        return cached
     data = np.load(os.path.join(args.dump_features, name + '.npy'),
                    allow_pickle=True).item()
+    n = len(data.get('features', ()))
     _SLIDE_CACHE[name] = data
+    _SLIDE_CACHE_PATCHES += n
+    while _SLIDE_CACHE_LIMIT and _SLIDE_CACHE_PATCHES > _SLIDE_CACHE_LIMIT and len(_SLIDE_CACHE) > 1:
+        _, evicted = _SLIDE_CACHE.popitem(last=False)
+        _SLIDE_CACHE_PATCHES -= len(evicted.get('features', ()))
     return data
+
+
+def _get_coords(slide_dict):
+    """Return (N, 2) int32 patch-grid coords for a cached slide dict.
+
+    New dicts written by feature_processor already have a 'coords' key.
+    For older dicts (or hand-built ones) we lazily parse the per-patch
+    filenames once and memoise back into the dict.
+    """
+    coords = slide_dict.get('coords')
+    if coords is not None:
+        return coords
+    pn = slide_dict.get('patch_names', [])
+    if len(pn) == 0:
+        coords = np.zeros((0, 2), dtype=np.int32)
+    else:
+        out = np.empty((len(pn), 2), dtype=np.int32)
+        for i, p in enumerate(pn):
+            x, y = p.split('/')[-1].split('.')[0].split('_')
+            out[i, 0] = int(x); out[i, 1] = int(y)
+        coords = out
+    slide_dict['coords'] = coords
+    return coords
 
 
 def _threshold_sweep(val_preds, val_labels, thresholds):
@@ -450,10 +506,14 @@ def evaluate(args, val_only=False):
 
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
+            example_slide_coords = []   # one (n_j, 2) int array per WSI
+            example_slide_offsets = [0] # cumulative patch counts -> (W+1,)
             for n in example_names:
                 example_n = _load_slide_features(args, n)
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
+                example_slide_coords.append(_get_coords(example_n))
+                example_slide_offsets.append(example_slide_offsets[-1] + example_n['features'].shape[0])
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
@@ -510,24 +570,27 @@ def evaluate(args, val_only=False):
             # assign in-context tags for weak prompts (binary tasks: 1 pos, 0 neg, -1 unknown)
             if args.prompt_type != 'mask' and args.c == 1:
                 example_labels = execute_tagger(example_feats, example_labels, example_patch_names, example_names, \
-                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                    vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                    slide_offsets=example_slide_offsets, slide_coords=example_slide_coords)
 
             # assign in-context tags for subtyping from slideLabel (255 normal, 254 uncertain, 1 this class, 0 other classes)
             if args.prompt_type == 'slideLabel' and args.c > 1:
                 example_labels = execute_subtyping_tagger(example_feats, example_labels, example_patch_names, \
-                    example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
-            
-            # subtyping + box / roughMask. Need to process "execute_tagger" twice. 
+                    example_names, vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                    slide_offsets=example_slide_offsets, slide_coords=example_slide_coords)
+
+            # subtyping + box / roughMask. Need to process "execute_tagger" twice.
             # Once for shared bg and this class, another for shared bg and other classes
             if args.prompt_type != 'slideLabel' and args.c > 1:
-                
+
                 if args.prompt_type != 'mask':
                     example_labels_this = example_labels.clone()
                     example_labels_this[example_labels_this == 0] = 254 # ignore other fg
                     example_labels_this[example_labels_this == 255] = 0 # subtyping bg label to binary neg label
                     example_labels_this[example_labels_this == 1] = -1  # this class to undertain to relabel
                     example_labels_this = execute_tagger(example_feats, example_labels_this, example_patch_names, example_names, \
-                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                        slide_offsets=example_slide_offsets, slide_coords=example_slide_coords)
 
                     vis_info = None
                     example_labels_others = example_labels.clone()
@@ -535,7 +598,8 @@ def evaluate(args, val_only=False):
                     example_labels_others[example_labels_others == 0] = -1  # other class to undertain to relabel
                     example_labels_others[example_labels_others == 255] = 0 # subtyping bg label to binary neg label
                     example_labels_others = execute_tagger(example_feats, example_labels_others, example_patch_names, example_names, \
-                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk)
+                        vis_info=vis_info, uncertain=args.ignore, topk=args.topk,
+                        slide_offsets=example_slide_offsets, slide_coords=example_slide_coords)
 
                     example_labels[:] = 255 # default bg
                     example_labels[example_labels_this == 1] = 1     # this class
@@ -583,7 +647,8 @@ def evaluate(args, val_only=False):
                 vis_info = None
 
                 wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
-                    query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm)
+                    query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm,
+                    query_coords=_get_coords(query_n))
 
                 if patch_pred != None and args.vis_path != '' and n in test_set:
                     os.makedirs(args.vis_path, exist_ok=True)
@@ -928,19 +993,18 @@ def evaluate_baseline(args, mode):
                         wsi_path = os.path.join(args.wsi_path, n + '.' + wsi_suffix)
                         wsi = openslide.OpenSlide(wsi_path)
                         size = (wsi.level_dimensions[0][1] // args.patch_scale, wsi.level_dimensions[0][0] // args.patch_scale)
-                        patch_pred = torch.zeros(size).cuda() + 255
-                        idx_in_map = []
-                        for pi, pn in enumerate(query_patch_names):
-                            x, y = pn.split('/')[-1].split('.')[0].split('_')
-                            try:
-                                patch_pred[int(y), int(x)] = prob[pi]
-                                idx_in_map.append(int(y) * patch_pred.shape[1] + int(x))
-                            except:
-                                if len(idx_in_map) != 0:
-                                    idx_in_map.append(idx_in_map[-1])
-                                else:
-                                    idx_in_map.append(0)
-                                continue
+                        H, W = size
+                        patch_pred = torch.full((H, W), 255.0, device=prob.device)
+
+                        # batched coord scatter (replaces per-patch parse + try/except)
+                        coords_q = _get_coords(query_n)
+                        x_t = torch.from_numpy(np.asarray(coords_q[:, 0], dtype=np.int64)).to(prob.device)
+                        y_t = torch.from_numpy(np.asarray(coords_q[:, 1], dtype=np.int64)).to(prob.device)
+                        in_bounds = (x_t >= 0) & (x_t < W) & (y_t >= 0) & (y_t < H)
+                        flat_full = (y_t.clamp_(0, H - 1) * W + x_t.clamp_(0, W - 1)).long()
+                        if in_bounds.any():
+                            patch_pred.view(-1).scatter_(0, flat_full[in_bounds], prob[in_bounds])
+                        idx_in_map = flat_full
 
                         if args.vis_path != '' and n in test_set:
                             os.makedirs(args.vis_path, exist_ok=True)
@@ -1100,10 +1164,14 @@ if __name__ == '__main__':
     parser.add_argument('--val_num', default=100, type=int, help='number of validation WSIs')
     parser.add_argument('--test_num', default=129, type=int, help='number of test WSIs')
     parser.add_argument('--val_ratio', default=-1, type=float, help='split val test via ratio to replace specific number')
+    parser.add_argument('--feature_cache_patches', default=5_000_000, type=int,
+        help='Max total patch features kept in memory across slides (FIFO eviction). '
+             'Set 0 for unbounded. Default ~20 GB at 1024-d fp32.')
     args = parser.parse_args()
 
     random.seed(args.seed)
     os.makedirs(args.dump_features, exist_ok=True)
+    _set_slide_cache_limit(args.feature_cache_patches)
 
     # collect features and information
     feature_processor(args)

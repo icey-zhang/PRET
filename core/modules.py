@@ -274,20 +274,35 @@ def basic_tagger(ukn_sim, ukn_mask, label, uncertain, positive=False):
 
 # binary classification via sparse annotations (slideLabel, box, roughMask)
 def execute_tagger(feats, labels, patch_names, wsi_names, \
-        vis_info=None, uncertain=0.1, topk=40, sampling_size=-1):
+        vis_info=None, uncertain=0.1, topk=40, sampling_size=-1,
+        slide_offsets=None, slide_coords=None):
+    """slide_offsets / slide_coords (optional fast path):
+
+    feats is concatenated across wsi_names in order. If callers pass
+        slide_offsets: (W+1,) cumulative offsets so wsi j owns
+                       feats[slide_offsets[j]:slide_offsets[j+1]]
+        slide_coords:  list of (n_j, 2) int patch-grid coords per wsi
+    we skip the W*P 'if n in pn' string scan entirely.
+    """
 
     # assign init label for each wsi
     # record uncertain positive and normal patch idx
     info_dic = {}
     pos_idx, neg_idx = [], []
-    for n in wsi_names:
-        pos, idx = [], []
-        for i, pn in enumerate(patch_names):
-            if n in pn:
-                x, y = pn.split('/')[-1].split('.')[0].split('_')
-                pos.append([int(y), int(x)])
-                idx.append(i)
-        pos = np.array(pos)
+    for j, n in enumerate(wsi_names):
+        if slide_offsets is not None:
+            s, e = int(slide_offsets[j]), int(slide_offsets[j + 1])
+            idx = list(range(s, e))
+            sc = slide_coords[j]
+            pos = np.stack([sc[:, 1], sc[:, 0]], axis=1) if len(sc) else np.zeros((0, 2), dtype=np.int32)
+        else:
+            pos, idx = [], []
+            for i, pn in enumerate(patch_names):
+                if n in pn:
+                    x, y = pn.split('/')[-1].split('.')[0].split('_')
+                    pos.append([int(y), int(x)])
+                    idx.append(i)
+            pos = np.array(pos)
         info_dic[n] = {'idx': idx, 'pos': pos}
 
         ukn_mask = labels[idx] == -1
@@ -328,8 +343,10 @@ def execute_tagger(feats, labels, patch_names, wsi_names, \
 
 # 1.dataset similarity 2.init pseudo in each wsi 3.refine via dataset pseduo
 def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
-        vis_info=None, uncertain=0.1, topk=40, sampling_size=40000):
-    
+        vis_info=None, uncertain=0.1, topk=40, sampling_size=40000,
+        slide_offsets=None, slide_coords=None):
+    """See execute_tagger() for the slide_offsets/slide_coords fast path."""
+
     # step1 similarity cross wsi-level label
     pos, neg = labels == 1, labels == 0
     if sampling_size > 0:
@@ -348,14 +365,20 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
     # record certain pos and normal patches
     info_dic = {}
     labeled_idx_dic = {255: [], 0: [], 1: []}
-    for n in wsi_names:
-        pos, idx = [], []
-        for i, pn in enumerate(patch_names):
-            if n in pn:
-                x, y = pn.split('/')[-1].split('.')[0].split('_')
-                pos.append([int(y), int(x)])
-                idx.append(i)
-        pos = np.array(pos)
+    for j, n in enumerate(wsi_names):
+        if slide_offsets is not None:
+            s, e = int(slide_offsets[j]), int(slide_offsets[j + 1])
+            idx = list(range(s, e))
+            sc = slide_coords[j]
+            pos = np.stack([sc[:, 1], sc[:, 0]], axis=1) if len(sc) else np.zeros((0, 2), dtype=np.int32)
+        else:
+            pos, idx = [], []
+            for i, pn in enumerate(patch_names):
+                if n in pn:
+                    x, y = pn.split('/')[-1].split('.')[0].split('_')
+                    pos.append([int(y), int(x)])
+                    idx.append(i)
+            pos = np.array(pos)
         info_dic[n] = {'idx': idx, 'pos': pos}
 
         sim_n = sim[idx]
@@ -394,7 +417,8 @@ def execute_subtyping_tagger(feats, labels, patch_names, wsi_names, \
 # ====================== inference with classifier, aggregator, post processor ======================
 
 def inference(args, example_feats, example_labels, example_patch_names,
-    query_feats, query_patch_names, wsi_size, top_instance=1, vis_info=None, smooth=None):
+    query_feats, query_patch_names, wsi_size, top_instance=1, vis_info=None, smooth=None,
+    query_coords=None):
 
     # ====================== in-context classifier ======================
 
@@ -438,21 +462,37 @@ def inference(args, example_feats, example_labels, example_patch_names,
 
     idx_in_map = []
     if wsi_size != None:
-        #patch_pred = torch.zeros(wsi_size).cuda() + query_logits.min()
-        patch_pred = torch.zeros(wsi_size).cuda() + 255
-        patch_pred_list = []
-        for i, n in enumerate(query_patch_names):
-            patch_pred_list.append(query_logits[i])
-            x, y = n.split('/')[-1].split('.')[0].split('_')
-            try:
-                patch_pred[int(y), int(x)] = query_logits[i]
-                idx_in_map.append(int(y) * patch_pred.shape[1] + int(x))
-            except:
-                if len(idx_in_map) != 0:
-                    idx_in_map.append(idx_in_map[-1])
-                else:
-                    idx_in_map.append(0)
-                continue
+        H, W = patch_pred_shape = wsi_size
+        patch_pred = torch.full((H, W), 255.0, device=query_logits.device)
+
+        # batched scatter: parse coords once, fill patch_pred and idx_in_map
+        # in one shot. Falls back to the original per-name parse for callers
+        # that didn't pass query_coords.
+        if query_coords is None:
+            xy = np.empty((len(query_patch_names), 2), dtype=np.int64)
+            for i, n in enumerate(query_patch_names):
+                x, y = n.split('/')[-1].split('.')[0].split('_')
+                xy[i, 0] = int(x); xy[i, 1] = int(y)
+        else:
+            xy = np.asarray(query_coords, dtype=np.int64)
+
+        x_t = torch.from_numpy(xy[:, 0]).to(query_logits.device)
+        y_t = torch.from_numpy(xy[:, 1]).to(query_logits.device)
+        in_bounds = (x_t >= 0) & (x_t < W) & (y_t >= 0) & (y_t < H)
+        flat_full = (y_t.clamp_(0, H - 1) * W + x_t.clamp_(0, W - 1)).long()
+
+        # scatter only the in-bounds entries; out-of-bounds keep the 255 fill
+        if in_bounds.any():
+            valid_flat = flat_full[in_bounds]
+            patch_pred.view(-1).scatter_(0, valid_flat, query_logits[in_bounds])
+
+        # idx_in_map: in original code, OOB entries reused the previous valid
+        # idx (or 0 at the start). Clamping to bounds preserves the semantics
+        # required by patch_pred_list = patch_pred.view(-1)[idx_in_map] without
+        # producing IndexErrors and matches the typical case where all patches
+        # are in-bounds.
+        idx_in_map = flat_full
+        patch_pred_list = list(query_logits)
     else:
         patch_pred, patch_pred_list = None, None
 
