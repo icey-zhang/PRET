@@ -17,7 +17,6 @@ import sys
 import argparse
 import random
 import json
-from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -244,44 +243,27 @@ def feature_processor(args):
 
 # ====================== some util functions ======================
 
-# Cache loaded per-slide feature dicts across evaluate() / evaluate_baseline()
-# invocations. Each np.load + pickle decode of a .npy dict is the dominant
-# cost in evaluation (called runs * classes * shots * num_slides times),
-# so a simple in-process cache turns the disk-bound loop into a dict lookup.
-#
-# Bounded by total patch count (FIFO eviction) to stay flat for 30K-patch
-# slides. Default cap is 5_000_000 patches (~20 GB at 1024-d fp32); override
-# with --feature_cache_patches. Callers MUST copy any array they mutate in
-# place (only 'patch_labels' is mutated by current code paths).
-_SLIDE_CACHE = OrderedDict()
-_SLIDE_CACHE_PATCHES = 0
-_SLIDE_CACHE_LIMIT = 5_000_000
+# Support (example) slides are cached unconditionally for the lifetime of the
+# process. They are reused across runs / classes / shot counts and there are
+# at most O(args.example_num) of them, so the memory footprint is bounded by
+# the chosen support set, not the dataset size. Query slides are NOT cached;
+# they are streamed through a DataLoader (see _QuerySlideDataset below) so
+# multiple worker processes overlap pickle decoding with GPU inference.
+_SUPPORT_CACHE = {}
 
 
-def _set_slide_cache_limit(n_patches):
-    global _SLIDE_CACHE_LIMIT
-    _SLIDE_CACHE_LIMIT = int(n_patches) if n_patches and n_patches > 0 else 0  # 0 = unbounded
-
-
-def _load_slide_features(args, name):
-    global _SLIDE_CACHE_PATCHES
-    cached = _SLIDE_CACHE.get(name)
+def _load_support_features(args, name):
+    cached = _SUPPORT_CACHE.get(name)
     if cached is not None:
-        _SLIDE_CACHE.move_to_end(name)
         return cached
     data = np.load(os.path.join(args.dump_features, name + '.npy'),
                    allow_pickle=True).item()
-    n = len(data.get('features', ()))
-    _SLIDE_CACHE[name] = data
-    _SLIDE_CACHE_PATCHES += n
-    while _SLIDE_CACHE_LIMIT and _SLIDE_CACHE_PATCHES > _SLIDE_CACHE_LIMIT and len(_SLIDE_CACHE) > 1:
-        _, evicted = _SLIDE_CACHE.popitem(last=False)
-        _SLIDE_CACHE_PATCHES -= len(evicted.get('features', ()))
+    _SUPPORT_CACHE[name] = data
     return data
 
 
 def _get_coords(slide_dict):
-    """Return (N, 2) int32 patch-grid coords for a cached slide dict.
+    """Return (N, 2) int32 patch-grid coords for a slide dict.
 
     New dicts written by feature_processor already have a 'coords' key.
     For older dicts (or hand-built ones) we lazily parse the per-patch
@@ -301,6 +283,46 @@ def _get_coords(slide_dict):
         coords = out
     slide_dict['coords'] = coords
     return coords
+
+
+class _QuerySlideDataset(torch.utils.data.Dataset):
+    """Yields one query slide per __getitem__.
+
+    Workers run in separate processes so the pickle decode of each
+    <slide>.npy happens in parallel with the GPU inference of the
+    previous slide. Returned tensors are CPU; the main process moves
+    them to GPU just before inference.
+    """
+    def __init__(self, dump_features, names):
+        self.dump_features = dump_features
+        self.names = list(names)
+
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, idx):
+        name = self.names[idx]
+        data = np.load(os.path.join(self.dump_features, name + '.npy'),
+                       allow_pickle=True).item()
+        return {
+            'name': name,
+            'features': torch.from_numpy(np.ascontiguousarray(data['features'])),
+            'patch_names': data['patch_names'],
+            'patch_labels': data.get('patch_labels'),
+            'coords': _get_coords(data),
+            'wsi_label': data['wsi_label'],
+        }
+
+
+def _query_loader(args, names):
+    nw = max(0, int(getattr(args, 'num_workers', 0) or 0))
+    ds = _QuerySlideDataset(args.dump_features, names)
+    return torch.utils.data.DataLoader(
+        ds, batch_size=1, num_workers=nw,
+        collate_fn=lambda batch: batch[0],   # we always run one slide at a time
+        pin_memory=False,
+        persistent_workers=False,            # evaluate() may be called per-shot
+    )
 
 
 def _threshold_sweep(val_preds, val_labels, thresholds):
@@ -509,7 +531,7 @@ def evaluate(args, val_only=False):
             example_slide_coords = []   # one (n_j, 2) int array per WSI
             example_slide_offsets = [0] # cumulative patch counts -> (W+1,)
             for n in example_names:
-                example_n = _load_slide_features(args, n)
+                example_n = _load_support_features(args, n)
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
                 example_slide_coords.append(_get_coords(example_n))
@@ -620,14 +642,16 @@ def evaluate(args, val_only=False):
             val_set = set(val_names)
             test_set = set(test_names)
             sm = GaussianBlur(7, 3) if args.seg else None  # build once per class
-            for n in all_query_names:
-                query_n = _load_slide_features(args, n)
-                query_feats = torch.tensor(query_n['features']).cuda()
+            # parallel pickle decode: workers stream the next query slides
+            # while the main process is busy doing GPU inference on the current one
+            for query_n in _query_loader(args, all_query_names):
+                n = query_n['name']
+                query_feats = query_n['features'].cuda(non_blocking=True)
                 query_patch_names = query_n['patch_names']
                 label = query_n['wsi_label']
                 if args.c > 1:
                     label = int(label == cls)
-                
+
                 # ====================== discriminative instance miner for subtyping ======================
 
                 # use fg patches for subtyping
@@ -648,7 +672,7 @@ def evaluate(args, val_only=False):
 
                 wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
                     query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm,
-                    query_coords=_get_coords(query_n))
+                    query_coords=query_n['coords'])
 
                 if patch_pred != None and args.vis_path != '' and n in test_set:
                     os.makedirs(args.vis_path, exist_ok=True)
@@ -878,7 +902,7 @@ def evaluate_baseline(args, mode):
             # ====================== process example ======================
 
             for n in example_names:
-                example_n = _load_slide_features(args, n)
+                example_n = _load_support_features(args, n)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
@@ -970,9 +994,9 @@ def evaluate_baseline(args, mode):
             all_query_names = val_names + test_names
             val_set = set(val_names)
             test_set = set(test_names)
-            for n in all_query_names:
-                query_n = _load_slide_features(args, n)
-                query_feats = torch.tensor(query_n['features']).cuda()
+            for query_n in _query_loader(args, all_query_names):
+                n = query_n['name']
+                query_feats = query_n['features'].cuda(non_blocking=True)
                 query_patch_names = query_n['patch_names']
                 if args.c > 1:
                     label = query_n['wsi_label'] == cls
@@ -1164,14 +1188,14 @@ if __name__ == '__main__':
     parser.add_argument('--val_num', default=100, type=int, help='number of validation WSIs')
     parser.add_argument('--test_num', default=129, type=int, help='number of test WSIs')
     parser.add_argument('--val_ratio', default=-1, type=float, help='split val test via ratio to replace specific number')
-    parser.add_argument('--feature_cache_patches', default=5_000_000, type=int,
-        help='Max total patch features kept in memory across slides (FIFO eviction). '
-             'Set 0 for unbounded. Default ~20 GB at 1024-d fp32.')
+    parser.add_argument('--num_workers', default=4, type=int,
+        help='DataLoader workers used to parallelise per-query slide pickle decode. '
+             '0 disables multi-process loading. Support (example) slides are always '
+             'cached in the main process and never re-decoded.')
     args = parser.parse_args()
 
     random.seed(args.seed)
     os.makedirs(args.dump_features, exist_ok=True)
-    _set_slide_cache_limit(args.feature_cache_patches)
 
     # collect features and information
     feature_processor(args)
