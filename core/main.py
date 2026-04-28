@@ -183,8 +183,12 @@ def feature_processor(args):
     dataset_info = json.load(open(args.dataset_info))
     os.makedirs(args.dump_features, exist_ok=True)
 
+    n_done, n_skip_existing, n_skip_missing, n_skip_empty = 0, 0, 0, 0
+    missing_examples = []
+
     for k, v in dataset_info.items():
         if os.path.exists(os.path.join(args.dump_features, k + '.npy')):
+            n_skip_existing += 1
             continue
 
         wsi_label = v['wsi_label']
@@ -199,17 +203,28 @@ def feature_processor(args):
         elif os.path.isdir(legacy_dir):
             feats, names, patch_label = _load_legacy_npy_slide(legacy_dir, v, args)
         else:
+            n_skip_missing += 1
+            if len(missing_examples) < 5:
+                missing_examples.append(k)
             continue
 
         if len(names) == 0:
+            n_skip_empty += 1
             continue
 
         # save patch features, name, patch_labels and wsi_labels for eval
         info = {'features': np.stack(feats, 0), 'patch_names': names, \
             'patch_labels': np.array(patch_label), 'wsi_label': wsi_label}
         np.save(os.path.join(args.dump_features, k + '.npy'), info)
+        n_done += 1
 
-    print('finish feature processing and saving!')
+    if n_skip_missing:
+        print('warning: %d slides have no extracted features (missing .h5/_files dir under %s); '
+              'first few: %s' % (n_skip_missing, args.raw_feature_path, missing_examples))
+    if n_skip_empty:
+        print('warning: %d slides skipped with 0 valid patches' % n_skip_empty)
+    print('finish feature processing: %d new, %d already cached, %d missing, %d empty (total %d)'
+          % (n_done, n_skip_existing, n_skip_missing, n_skip_empty, len(dataset_info)))
 
 
 # ====================== some util functions ======================
@@ -278,6 +293,18 @@ def evaluate(args, val_only=False):
     info_str = open(args.dataset_info).read()
     dataset_info = json.load(open(args.dataset_info))
     all_names = dataset_info.keys()
+
+    # drop slides whose features failed to extract (matches evaluate_baseline)
+    available, missing = [], []
+    for _ in all_names:
+        if os.path.exists(os.path.join(args.dump_features, _ + '.npy')):
+            available.append(_)
+        else:
+            missing.append(_)
+    if missing:
+        print('warning: %d/%d slides have no collected features and will be skipped (e.g. %s)'
+              % (len(missing), len(missing) + len(available), missing[0]))
+    all_names = available
 
     records = {}
     txt_rec = []
