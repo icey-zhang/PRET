@@ -229,6 +229,43 @@ def feature_processor(args):
 
 # ====================== some util functions ======================
 
+# Cache loaded per-slide feature dicts across evaluate() / evaluate_baseline()
+# invocations. Each np.load + pickle decode of a .npy dict is the dominant
+# cost in evaluation (called runs * classes * shots * num_slides times),
+# so a simple in-process cache turns the disk-bound loop into a dict lookup.
+# Callers MUST copy any array they mutate in place (only 'patch_labels' is
+# mutated by current code paths).
+_SLIDE_CACHE = {}
+
+
+def _load_slide_features(args, name):
+    if name in _SLIDE_CACHE:
+        return _SLIDE_CACHE[name]
+    data = np.load(os.path.join(args.dump_features, name + '.npy'),
+                   allow_pickle=True).item()
+    _SLIDE_CACHE[name] = data
+    return data
+
+
+def _threshold_sweep(val_preds, val_labels, thresholds):
+    """Vectorised replacement for the per-threshold list comprehension.
+
+    val_preds:   1-D float (N,)
+    val_labels:  1-D int/float 0/1 (N,)
+    thresholds:  1-D float (T,)
+    Returns accs as 1-D float (T,) with the same semantics as the original
+    [((val_preds > t).float() == val_labels).sum() / N for t in thresholds].
+    """
+    if hasattr(val_preds, 'numpy'):
+        val_preds = val_preds.numpy()
+    if hasattr(val_labels, 'numpy'):
+        val_labels = val_labels.numpy()
+    val_labels_bool = val_labels.astype(bool)
+    # broadcast: (T, N) bool grid
+    pred_grid = val_preds[None, :] > thresholds[:, None]
+    return (pred_grid == val_labels_bool[None, :]).mean(axis=1)
+
+
 def macro_value(l, n):
     out = []
     for i in range(len(l) // n):
@@ -369,14 +406,16 @@ def evaluate(args, val_only=False):
                 break
 
         # split val set out of example and test set
+        example_set = set(example_names)
+        neg_set = set(neg_names)
         for n in all_names:
-            if n not in example_names and dataset_info[n]['fixed_test_set'] == False:
+            if n not in example_set and dataset_info[n]['fixed_test_set'] == False:
                 rest_names.append(n)
 
         if args.seg:
             rest_names = []
             for ln in labeled_names:
-                if ln not in example_names and ln not in neg_names:
+                if ln not in example_set and ln not in neg_set:
                     rest_names.append(ln)
 
         # avoid same patients in different split, in-house data is cleaned
@@ -412,13 +451,13 @@ def evaluate(args, val_only=False):
             # load example
             example_feats, example_patch_names, example_labels = [], [], []
             for n in example_names:
-                example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_n = _load_slide_features(args, n)
                 example_patch_names = example_patch_names + example_n['patch_names']
                 example_feats.append(example_n['features'])
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    pl = example_n['patch_labels'].copy()  # mutated below; cache stays clean
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
@@ -513,8 +552,12 @@ def evaluate(args, val_only=False):
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
             wsi_suffix = _resolve_wsi_suffix(args.wsi_path)
             all_query_names = val_names if val_only else val_names + test_names
+            # O(1) membership lookups in the per-slide loop below
+            val_set = set(val_names)
+            test_set = set(test_names)
+            sm = GaussianBlur(7, 3) if args.seg else None  # build once per class
             for n in all_query_names:
-                query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                query_n = _load_slide_features(args, n)
                 query_feats = torch.tensor(query_n['features']).cuda()
                 query_patch_names = query_n['patch_names']
                 label = query_n['wsi_label']
@@ -538,15 +581,14 @@ def evaluate(args, val_only=False):
                 else:
                     size = None
                 vis_info = None
-                
-                sm = GaussianBlur(7, 3) if args.seg else None #  seg pred
+
                 wsi_pred, patch_pred, patch_pred_list = inference(args, example_feats, example_labels, example_patch_names, \
                     query_feats, query_patch_names, size, args.top_instance, vis_info, smooth=sm)
 
-                if patch_pred != None and args.vis_path != '' and n in test_names:
+                if patch_pred != None and args.vis_path != '' and n in test_set:
                     os.makedirs(args.vis_path, exist_ok=True)
                     np.save(os.path.join(args.vis_path, n + '_' + str(cls) + '.npy'), patch_pred.cpu().numpy())
-                
+
                 if args.seg:
                     pred = torch.tensor(patch_pred_list)
                     label = torch.tensor(query_n['patch_labels'])
@@ -554,7 +596,7 @@ def evaluate(args, val_only=False):
                     pred = torch.tensor([wsi_pred])
                     label = torch.tensor([label])
 
-                if n in val_names:
+                if n in val_set:
                     val_preds.append(pred)
                     val_labels.append(label)
                 else:
@@ -573,7 +615,7 @@ def evaluate(args, val_only=False):
                 test_labels = torch.cat(test_labels)
             
             precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
+            accs = _threshold_sweep(val_preds, val_labels, thresholds)
             if args.seg:
                 f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
                 best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
@@ -723,14 +765,16 @@ def evaluate_baseline(args, mode):
                 break
 
         # split val set out of example and test set
+        example_set = set(example_names)
+        neg_set = set(neg_names)
         for n in all_names:
-            if n not in example_names and dataset_info[n]['fixed_test_set'] == False:
+            if n not in example_set and dataset_info[n]['fixed_test_set'] == False:
                 rest_names.append(n)
 
         if args.seg:
             rest_names = []
             for ln in labeled_names:
-                if ln not in example_names and ln not in neg_names:
+                if ln not in example_set and ln not in neg_set:
                     rest_names.append(ln)
 
         if _dataset_match(args, 'TCGA'):
@@ -769,11 +813,11 @@ def evaluate_baseline(args, mode):
             # ====================== process example ======================
 
             for n in example_names:
-                example_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                example_n = _load_slide_features(args, n)
 
                 # empty patch label for image label or sparse label where there is no offline gt
                 if args.prompt_type == 'mask':
-                    pl = example_n['patch_labels']
+                    pl = example_n['patch_labels'].copy()  # mutated below; cache stays clean
 
                     # binary use 0 normal, 1 tumor, while subtyping use 0 other cls, 1 this cls, 255 normal
                     if args.c > 1:
@@ -859,8 +903,10 @@ def evaluate_baseline(args, mode):
             # predict query
             val_preds, test_preds, val_labels, test_labels = [], [], [], []
             all_query_names = val_names + test_names
+            val_set = set(val_names)
+            test_set = set(test_names)
             for n in all_query_names:
-                query_n = np.load(os.path.join(args.dump_features, n + '.npy'), allow_pickle=True).item()
+                query_n = _load_slide_features(args, n)
                 query_feats = torch.tensor(query_n['features']).cuda()
                 query_patch_names = query_n['patch_names']
                 if args.c > 1:
@@ -896,7 +942,7 @@ def evaluate_baseline(args, mode):
                                     idx_in_map.append(0)
                                 continue
 
-                        if args.vis_path != '' and n in test_names:
+                        if args.vis_path != '' and n in test_set:
                             os.makedirs(args.vis_path, exist_ok=True)
                             np.save(os.path.join(args.vis_path, n + '_' + str(cls) + '.npy'), patch_pred.cpu().numpy())
 
@@ -932,7 +978,7 @@ def evaluate_baseline(args, mode):
                     pred = torch.tensor([wsi_pred])
                     label = torch.tensor([label])
 
-                if n in val_names:
+                if n in val_set:
                     val_preds.append(pred)
                     val_labels.append(label)
                 else:
@@ -949,7 +995,7 @@ def evaluate_baseline(args, mode):
             test_labels = torch.cat(test_labels)
             
             precisions, recalls, thresholds = precision_recall_curve(val_labels.numpy(), val_preds.numpy())
-            accs = np.array([((val_preds > _).float() == val_labels).sum() / val_labels.shape[0] for _ in thresholds])
+            accs = _threshold_sweep(val_preds, val_labels, thresholds)
             if args.seg:
                 f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
                 best_f1_score_index = np.argmax(f1_scores[np.isfinite(f1_scores)])
