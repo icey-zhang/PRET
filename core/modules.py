@@ -106,15 +106,39 @@ def load_weak_prompts(fn, wsi_label, wsi_dir, patch_labels, patch_names, anno_di
 
 # ====================== some util functions ======================
 
-def compute_similarity(query, example, topk=40):
-    sim = low_memory_matrix_multiply(example, query.t())
-    if topk > 0:
-        sim, _ = topk_low_memory_(sim, min(topk, sim.shape[0]))
-        sim = sim.mean(0)
-    else:
-        sim = sim.mean(0)
+def _chunked_topk_mean(example, query, topk=40, chunk=4096):
+    """Fused (example @ query.t()).topk(k, dim=0).values.mean(0) on GPU.
 
-    return sim
+    Streams the (N_ex, N_q) sim matrix in chunks along the query axis so
+    peak memory stays at N_ex * chunk floats. Never goes through CPU.
+    Replaces the legacy low_memory_matrix_multiply + topk_low_memory_
+    pair which both round-tripped through CPU and contained an N_q-long
+    per-column Python loop in topk_low_memory.
+
+    Args:
+        example: (N_ex, D) tensor on GPU.
+        query:   (N_q, D) tensor on GPU (or any device matching `example`).
+        topk:    int; <=0 disables the topk reduction (column mean only).
+        chunk:   query-axis chunk size in patches.
+
+    Returns:
+        (N_q,) tensor on the same device as `example`.
+    """
+    out = []
+    nq = query.shape[0]
+    if nq == 0:
+        return query.new_zeros(0)
+    for s in range(0, nq, chunk):
+        e = min(s + chunk, nq)
+        sim = example @ query[s:e].t()           # (N_ex, c)
+        if topk and topk > 0 and topk < sim.shape[0]:
+            sim = sim.topk(topk, dim=0).values   # (k, c)
+        out.append(sim.mean(0))                  # (c,)
+    return torch.cat(out, 0)
+
+
+def compute_similarity(query, example, topk=40):
+    return _chunked_topk_mean(example, query, topk=topk)
 
 
 def low_memory_matrix_multiply(A, B, max_size=20000):
@@ -226,25 +250,22 @@ def vis_heat(score, label, pos, f, wsi_dir, vis_dir, mask_dir, side=512):
 # ====================== instance miner for subtyping ======================
 
 def execute_miner(neg_example_feats, feats, names, topk=40, uncertain=0.2):
-    sim = []
-    for i in range(math.ceil(neg_example_feats.shape[0] / 10000)):
-        sim.append((neg_example_feats[i * 10000: (i + 1) * 10000] @ feats.t()).cpu())
-    sim = torch.cat(sim, 0)#.cuda()
-    #sim = neg_example_feats @ feats.t()
+    # Hot path: this is called once per query slide for subtyping. Previously
+    # built the full (N_neg, N_q) sim matrix on CPU and then ran a topk that
+    # contained an N_q-long Python loop inside topk_low_memory_. We now do a
+    # single fused chunked GPU matmul + topk + mean.
+    sim = _chunked_topk_mean(neg_example_feats, feats, topk=topk)
 
-    sim, _ = topk_low_memory_(sim, min(topk, sim.shape[0]))
-    sim = sim.mean(0)
     ukn = torch.ones(len(names)) == 1
     fg = torch.zeros(len(names)).long()
     fg = basic_tagger(sim, ukn, fg, uncertain, positive=False)
     fg = fg == 1
-    
+
     if fg.sum() == 0:
         return feats, names
 
-    out_names = []
-    for i in fg.nonzero()[:, 0].cpu().numpy():
-        out_names.append(names[i])
+    fg_idx = fg.nonzero()[:, 0].cpu().numpy()
+    out_names = [names[i] for i in fg_idx]
     return feats[fg], out_names
 
 
@@ -422,41 +443,34 @@ def inference(args, example_feats, example_labels, example_patch_names,
 
     # ====================== in-context classifier ======================
 
-    # we name a test case a query to avoid confusin confusion with test set
-    query_feats = query_feats.t()
-
-    # aviod out of memory to split matrix and concat in cpu
-    cosine = []
-    for i in range(math.ceil(example_feats.shape[0] / 10000)):
-        cosine.append((example_feats[i * 10000: (i + 1) * 10000] @ query_feats).cpu())
-    cosine = torch.cat(cosine, 0)#.cuda()
-    example_labels = example_labels.cpu()
-
-    pos_cosine = cosine[example_labels == 1]
-    pos_cosine, pos_example_idxs = topk_low_memory_(pos_cosine, args.topk)
-    neg_cosine = cosine[example_labels == 0]
-    neg_cosine, neg_example_idxs = topk_low_memory_(neg_cosine, args.topk)
-
-    query_logits = pos_cosine.cuda().mean(0) - neg_cosine.cuda().mean(0)
+    # Fused on-GPU cosine + topk + mean for the pos/neg example halves.
+    # Replaces the previous CPU-roundtripped cosine + topk_low_memory_ pair
+    # whose Python-level per-column loop was the dominant cost in inference.
+    pos_logits = _chunked_topk_mean(example_feats[example_labels == 1], query_feats, args.topk)
+    neg_logits = _chunked_topk_mean(example_feats[example_labels == 0], query_feats, args.topk)
+    query_logits = pos_logits - neg_logits  # (N_q,)
 
     # ====================== attention aggregator ======================
 
-    # using related patchs and topk
-    top_query_num = min(top_instance, len(query_patch_names))
+    top_query_num = min(top_instance, query_feats.shape[0])
     top_query_logits, top_query_idxs = query_logits.topk(top_query_num)
 
-    # self-attention for test patches with high patch score
-    wsi_pred_list = []
-    for i in range(top_query_num):
-        wsi_pred, query_idx_i = top_query_logits[i], top_query_idxs[i]
-        sim = query_feats[:, query_idx_i: query_idx_i + 1].t() @ query_feats
-        sim_score, sim_idxs = sim[0].sort()
-        num = (sim_score > args.related_thresh).sum()
-        related_preds = query_logits[sim_idxs[-int(num):]]
-        w = (sim_score[-int(num):] * args.temperature).softmax(0)
-        wsi_pred = (w * related_preds).sum()
-        wsi_pred_list.append(wsi_pred)
-    wsi_pred = sum(wsi_pred_list) / len(wsi_pred_list)
+    # Vectorised self-attention: replace the per-top-query Python loop
+    # (top_instance can be 3000) with a single (T, N_q) sort + masked
+    # softmax + gather. Math is preserved: for each top-query i we keep
+    # patches with sim > related_thresh, softmax over their (sim*T), and
+    # weighted-sum the corresponding query_logits.
+    top_q_feats = query_feats[top_query_idxs]                     # (T, D)
+    sim_all = top_q_feats @ query_feats.t()                       # (T, N_q)
+    sim_score, sim_idxs = sim_all.sort(dim=1)                     # ascending
+    masks = sim_score > args.related_thresh                       # (T, N_q)
+    masked_scores = torch.where(
+        masks, sim_score * args.temperature,
+        torch.full_like(sim_score, float('-inf')))
+    w = masked_scores.softmax(dim=1)                              # (T, N_q)
+    gathered_preds = torch.gather(
+        query_logits.unsqueeze(0).expand(top_query_num, -1), 1, sim_idxs)
+    wsi_pred = (w * gathered_preds).sum(dim=1).mean()
 
     # ====================== patch reshape to wsi for heatmap / seg ======================
 
